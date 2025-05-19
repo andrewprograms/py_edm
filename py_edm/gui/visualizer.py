@@ -22,7 +22,7 @@ from typing import Optional, Sequence
 import math
 import random
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, QPointF
+from PyQt6.QtCore import Qt, QTimer, QPointF, QSize, QEvent
 from PyQt6.QtGui import QPainter, QPainterPath, QColor, QRadialGradient
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 
@@ -90,6 +90,14 @@ class VisualizerWidget(QWidget):
         self._samples = None
         # Reset amplitude to base level so animation settles
         self._hex.set_amplitude(0.0)
+
+    def sizeHint(self) -> QSize:                # optional – gives a nice default
+        return QSize(400, 400)
+
+    def resizeEvent(self, ev: QEvent) -> None:   # keep it square
+        side = min(self.width(), self.height())
+        self._hex.setFixedSize(side, side)       # _hex is the HexClusterWidget
+        super().resizeEvent(ev)
 
 class _RingSpec:
     __slots__: Sequence[str] = (

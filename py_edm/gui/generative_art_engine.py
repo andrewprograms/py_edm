@@ -89,6 +89,12 @@ class HexClusterWidget(QWidget):
         self._fig, self._ax = plt.subplots(figsize=(4, 4))
         self._canvas = FigureCanvas(self._fig)
 
+        # ── NEW: dark theme ────────────────────────────────────────────────
+        dark = "#1e1e1e"
+        self._fig.patch.set_facecolor(dark)     # figure background
+        self._ax.set_facecolor(dark)            # axes background
+        self._canvas.setStyleSheet(f"background-color:{dark};")  # Qt side
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._canvas)

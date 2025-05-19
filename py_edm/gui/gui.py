@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 import simpleaudio as sa  # noqa: F401  — kept for potential future use
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -174,6 +174,158 @@ class DragDial(QDial):
         self._last = None
         ev.accept()
         return 
+
+
+
+class _DraggablePoint(pg.ScatterPlotItem):
+    """
+    A single draggable control point that lives in plot-data coordinates.
+    Emits *sigMoved(self)* while it is being dragged.
+    """
+    sigMoved = pyqtSignal(object)          # self
+
+    def __init__(self, **spot_kw):
+        super().__init__(pen=pg.mkPen("#64b5f6"),
+                         brush=pg.mkBrush("#64b5f6"),
+                         size=10,
+                         symbol="o",
+                         **spot_kw)
+        self.setAcceptHoverEvents(True)
+
+    # …all the mouse stuff lives here…
+    def mouseDragEvent(self, ev):
+        if ev.button() != Qt.MouseButton.LeftButton:
+            ev.ignore(); return
+        if ev.isStart():                     # remember offset
+            self._start  = self.pos()
+            self._dstart = ev.pos()
+            ev.accept(); return
+        if ev.isFinish():
+            ev.accept(); return
+
+        # Map Qt-coords → plot-coords, move the point and notify listeners
+        delta = self.mapToParent(ev.pos()) - self.mapToParent(self._dstart)
+        new_p = self._start + delta
+        self.setData(pos=[(new_p.x(), new_p.y())])
+        self.sigMoved.emit(self)
+        ev.accept()
+
+
+class ADSRGraph(pg.PlotWidget):
+    """
+    Interactive ADSR display.  
+    Four movable break-points control the same parameters as the
+    Attack / Decay / Sustain / Release knobs.
+
+    Signals (all int):
+        attackChanged     ms
+        decayChanged      ms
+        sustainChanged    0-100  %
+        releaseChanged    ms
+    """
+    attackChanged  = pyqtSignal(int)
+    decayChanged   = pyqtSignal(int)
+    sustainChanged = pyqtSignal(int)
+    releaseChanged = pyqtSignal(int)
+
+    def __init__(self, settings: ADSRSettings, *a, **kw):
+        super().__init__(*a, **kw)
+        self.setBackground("#1e1e1e")
+        self.showGrid(x=False, y=True, alpha=0.2)
+        self.getPlotItem().hideAxis("bottom")
+        self.setMouseEnabled(x=False, y=False)
+
+        self._settings = settings
+        self._curve    = self.plot([], [], pen=pg.mkPen(width=2))
+        self._make_points()
+        self._replot()
+
+    # ─────────────────────────────────────────────────────────────── points
+    def _make_points(self):
+        """Create / connect three time-points + one sustain-level point."""
+        self._p_atk   = _DraggablePoint()
+        self._p_dec   = _DraggablePoint()
+        self._p_rel   = _DraggablePoint()
+        self._p_susLV = _DraggablePoint()          # vertical move only
+
+        for p in (self._p_atk, self._p_dec, self._p_rel, self._p_susLV):
+            self.addItem(p)
+
+        # Hook up drag-notifications
+        self._p_atk.sigMoved.connect(self._on_attack_drag)
+        self._p_dec.sigMoved.connect(self._on_decay_drag)
+        self._p_rel.sigMoved.connect(self._on_release_drag)
+        self._p_susLV.sigMoved.connect(self._on_sustain_drag)
+
+    # ─────────────────────────────────────────────────────── drag handlers
+    def _on_attack_drag(self, p):
+        atk_ms = max(1, int(p.pos().x() * 1000))
+        self._settings.attack_ms = atk_ms
+        self.attackChanged.emit(atk_ms)
+        self._replot()
+
+    def _on_decay_drag(self, p):
+        # decay duration  =  end-pos – attack-end-pos
+        dec_ms = max(1, int((p.pos().x() -
+                             self._settings.attack_s) * 1000))
+        self._settings.decay_ms = dec_ms
+        self.decayChanged.emit(dec_ms)
+        # also maybe sustain level if y changed
+        self._maybe_emit_sustain(p.pos().y())
+        self._replot()
+
+    def _on_release_drag(self, p):
+        rel_ms = max(10, int((p.pos().x() -
+                              (self._settings.attack_s +
+                               self._settings.decay_s + 0.2)) * 1000))
+        self._settings.release_ms = rel_ms
+        self.releaseChanged.emit(rel_ms)
+        self._replot()
+
+    def _on_sustain_drag(self, p):
+        self._maybe_emit_sustain(p.pos().y())
+        self._replot()
+
+    def _maybe_emit_sustain(self, y):
+        sus = max(0, min(1, y))
+        self._settings.sustain_level = sus
+        self.sustainChanged.emit(int(round(sus * 100)))
+
+    # ─────────────────────────────────────────────────────────────── UI sync
+    def set_from_knobs(self, settings: ADSRSettings):
+        """Called by knobs → refresh graph."""
+        self._settings = settings
+        self._replot()
+
+    # ───────────────────────────────────────────────────────── draw curve
+    def _replot(self):
+        s = self._settings
+        atk, dec, sus, rel = s.attack_s, s.decay_s, s.sustain_level, s.release_s
+
+        # (same maths you already had, shortened)
+        sr = 1000
+        t_a = np.linspace(0, atk, max(1, int(sr*atk)), endpoint=False)
+        env_a = 1 - np.exp(-5 * t_a / atk) if atk else np.array([])
+        t_d = np.linspace(0, dec, max(1, int(sr*dec)), endpoint=False)
+        env_d = sus + (1 - sus)*np.exp(-5 * t_d / dec) if dec else np.array([])
+        t_s = np.linspace(0, 0.2, int(sr*0.2), endpoint=False)
+        env_s = np.full_like(t_s, sus)
+        t_r = np.linspace(0, rel, max(1, int(sr*rel)))
+        env_r = sus*np.exp(-5 * t_r / rel) if rel else np.array([])
+
+        env = np.concatenate([env_a, env_d, env_s, env_r])
+        t   = np.arange(env.size)/sr
+        self._curve.setData(t, env)
+
+        # place / clamp the four draggable points
+        self._p_atk.setData(pos=[(atk, 1)])
+        self._p_dec.setData(pos=[(atk+dec, sus)])
+        self._p_susLV.setData(pos=[(atk+dec+0.001, sus)])   # tiny offset → visible
+        self._p_rel.setData(pos=[(atk+dec+0.2+rel, 0)])
+        self.setXRange(0, atk+dec+0.2+rel*1.05, padding=0)
+        self.setYRange(0, 1.05, padding=0)
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -341,22 +493,10 @@ class SynthUI(QWidget):
         layout.addLayout(knob_grid)
 
         # --------------------------------------------------------------
-        # ADSR envelope preview
+        # ADSR envelope preview  (now interactive)
         # --------------------------------------------------------------
-        self.adsr_plot = pg.PlotWidget(title="ADSR Envelope")
-        self.adsr_plot.setBackground("#1e1e1e")
-        self.adsr_plot.setYRange(0, 1.05)
-        self.adsr_plot.getPlotItem().hideAxis("bottom")
-        layout.addWidget(self.adsr_plot)
-
-        # Update preview whenever ADSR knobs move
-        for knob in (
-            self.attack_knob,
-            self.decay_knob,
-            self.sustain_knob,
-            self.release_knob,
-        ):
-            knob.dial.valueChanged.connect(self._refresh_adsr_plot)
+        self.adsr_plot = ADSRGraph(self._collect_adsr(), title="ADSR Envelope")
+        layout.addWidget(self.adsr_plot)       # add **once** – ADSRGraph styles itself
 
         # --------------------------------------------------------------
         # Waveform graph (PyQtGraph)
@@ -386,8 +526,26 @@ class SynthUI(QWidget):
         layout.addWidget(self.dist_btn)
         layout.addWidget(self.reverb_btn)
 
-        # Initial ADSR draw
-        self._refresh_adsr_plot()
+        # knobs –→ graph
+        for knob, setter in (
+            (self.attack_knob,  lambda v: self.adsr_plot.set_from_knobs(self._collect_adsr())),
+            (self.decay_knob,   lambda v: self.adsr_plot.set_from_knobs(self._collect_adsr())),
+            (self.sustain_knob, lambda v: self.adsr_plot.set_from_knobs(self._collect_adsr())),
+            (self.release_knob, lambda v: self.adsr_plot.set_from_knobs(self._collect_adsr())),
+        ):
+            knob.dial.valueChanged.connect(setter)
+
+        # graph –→ knobs
+        def _safe_set(dial, val):
+            dial.blockSignals(True); dial.setValue(val); dial.blockSignals(False)
+
+        self.adsr_plot.attackChanged.connect(lambda ms: _safe_set(self.attack_knob.dial,  ms))
+        self.adsr_plot.decayChanged.connect( lambda ms: _safe_set(self.decay_knob.dial,   ms))
+        self.adsr_plot.releaseChanged.connect(lambda ms: _safe_set(self.release_knob.dial, ms))
+        self.adsr_plot.sustainChanged.connect(
+            lambda pct: _safe_set(self.sustain_knob.dial, pct))
+
+        # no explicit initial draw – ADSRGraph already plotted itself
 
     # ------------------------------------------------------------------
     # 🎚  helpers
