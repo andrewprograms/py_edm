@@ -55,6 +55,7 @@ class KnobWidget(QGroupBox):
         step: int = 1,
     ):
         super().__init__()
+        self.setMinimumHeight(100)
         self._ensure_dark_mode()
         self.setTitle(label)
         self.setLayout(QVBoxLayout())
@@ -302,7 +303,8 @@ class SynthUI(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PyEDM Synth")
-        self.resize(460, 480)
+        self.resize(640, 640)
+        self.setMinimumSize(480, 480)
 
         self.synth = LaserSynth()
         self._play_obj = None
