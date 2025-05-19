@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Entry point for the Laser Synth application.
+"""Entry point for the Py EDM application.
 """
 
 import sys

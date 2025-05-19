@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-"""PyQt6 front‑end for the laser synth – Ableton‑style version.
-
-Highlights
-----------
-* Ableton‑style circular knobs (custom‑styled `QDial`) for ADSR & volume.
-* Real‑time waveform graph via **PyQtGraph**.
-* Built‑in hard limiter – audio is always clipped to ±1.0 before playback.
+"""PyQt6 front‑end for pyedm.
 """
 
 from pathlib import Path
@@ -16,8 +10,10 @@ import numpy as np
 import simpleaudio as sa  # noqa: F401  — kept for potential future use
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPalette, QColor
 from PyQt6.QtWidgets import (
+    QApplication,
+    QStyleFactory,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -36,6 +32,7 @@ from adsr.adsr import ADSRSettings
 from effects.effects import LaserSynth
 from effects.distortion import DistortionSettings, _ALGOS
 from effects.reverb import ReverbSettings
+from .visualizer import VisualizerWidget
 
 import wave
 import os
@@ -46,7 +43,7 @@ import tempfile
 # ⚙️  Custom widgets
 # -----------------------------------------------------------------------------
 class KnobWidget(QGroupBox):
-    """Circular knob with read‑out label – styled to resemble Ableton Live."""
+    """Circular knob with read‑out label"""
 
     def __init__(
         self,
@@ -58,6 +55,7 @@ class KnobWidget(QGroupBox):
         step: int = 1,
     ):
         super().__init__()
+        self._ensure_dark_mode()
         self.setTitle(label)
         self.setLayout(QVBoxLayout())
 
@@ -67,7 +65,7 @@ class KnobWidget(QGroupBox):
         self.dial.setValue(init_val)
         self.dial.setNotchesVisible(True)
 
-        # — Ableton‑style dark dial with bright handle
+        # — dark dial with bright handle
         self.dial.setStyleSheet(
             """
             QDial {
@@ -103,6 +101,32 @@ class KnobWidget(QGroupBox):
     def value(self) -> int:
         return self.dial.value()
 
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ensure_dark_mode() -> None:
+        """Apply a Fusion dark palette to the QApplication (idempotent)."""
+        app = QApplication.instance()
+        if app is None or getattr(app, "_dark_mode_applied", False):
+            return
+
+        app.setStyle(QStyleFactory.create("Fusion"))
+
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window,           QColor("#121212"))
+        pal.setColor(QPalette.ColorRole.WindowText,       QColor("#e0e0e0"))
+        pal.setColor(QPalette.ColorRole.Base,             QColor("#1e1e1e"))
+        pal.setColor(QPalette.ColorRole.AlternateBase,    QColor("#212121"))
+        pal.setColor(QPalette.ColorRole.ToolTipBase,      QColor("#212121"))
+        pal.setColor(QPalette.ColorRole.ToolTipText,      QColor("#e0e0e0"))
+        pal.setColor(QPalette.ColorRole.Text,             QColor("#e0e0e0"))
+        pal.setColor(QPalette.ColorRole.Button,           QColor("#1f1f1f"))
+        pal.setColor(QPalette.ColorRole.ButtonText,       QColor("#e0e0e0"))
+        pal.setColor(QPalette.ColorRole.BrightText,       QColor("#ff5252"))
+        pal.setColor(QPalette.ColorRole.Link,             QColor("#64b5f6"))
+        pal.setColor(QPalette.ColorRole.Highlight,        QColor("#2962ff"))
+        pal.setColor(QPalette.ColorRole.HighlightedText,  QColor("#ffffff"))
+        app.setPalette(pal)
+        app._dark_mode_applied = True
 
 # -----------------------------------------------------------------------------
 # Legacy sliders for the effect dialogs (unchanged)
@@ -232,7 +256,7 @@ class SynthUI(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Laser Synth (Ableton edition)")
+        self.setWindowTitle("PyEDM Synth")
         self.resize(460, 480)
 
         self.synth = LaserSynth()
@@ -242,6 +266,10 @@ class SynthUI(QWidget):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        
+        # -- visualizer sits on top ----
+        self.visualizer = VisualizerWidget(self)
+        layout.addWidget(self.visualizer)
 
         # --------------------------------------------------------------
         # Knobs (Attack, Decay, Sustain, Release, Volume)
@@ -339,6 +367,9 @@ class SynthUI(QWidget):
         effect.setVolume(volume)
         effect.play()
 
+        # Kick-off the visual animation
+        self.visualizer.start(samples, self.synth.sample_rate)
+
         # 3️⃣  when playback *finishes*, destroy the effect *first*,
         #     then delete the file a moment later
         def _tidy():
@@ -346,6 +377,9 @@ class SynthUI(QWidget):
                 path = Path(wav_path)  # capture before effect dies
                 effect.deleteLater()  # releases the handle soon
                 QTimer.singleShot(0, lambda: path.unlink(missing_ok=True))
+
+                # Stop the visualiser once the sound is done
+                self.visualizer.stop()
 
         effect.playingChanged.connect(_tidy)
 

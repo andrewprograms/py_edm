@@ -1,5 +1,5 @@
 """
-Very small-footprint reverb for Laser Synth.
+Very small-footprint reverb for pyedm.
 
 A single-channel Schroeder–Moore style reverb using four comb filters in
 parallel followed by two all-pass filters.  All maths is done in float32
