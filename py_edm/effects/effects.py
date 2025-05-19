@@ -13,6 +13,7 @@ from adsr.adsr import ADSRSettings, ADSREnvelope
 from config.config import SAMPLE_RATE
 
 from effects.distortion import DistortionProcessor, DistortionSettings
+from effects.reverb import ReverbProcessor, ReverbSettings
 
 
 DEFAULT_DURATION = 1.2  # seconds before release kicks in
@@ -28,6 +29,9 @@ class LaserSynth:
 
         # leave None to disable distortion
         self._dist_proc: DistortionProcessor | None = None
+
+        # leave None to disable reverb
+        self._reverb_proc: ReverbProcessor | None = None
 
     # ---------------------------------------------------------------------
     def _generate_saw(self, duration: float) -> np.ndarray:
@@ -65,6 +69,11 @@ class LaserSynth:
             None if settings is None else DistortionProcessor(settings)
         )
 
+    # --------------------------------------------------------------
+    def set_reverb(self, settings: ReverbSettings | None) -> None:
+        """Enable or update reverb.  Pass *None* to disable."""
+        self._reverb_proc = None if settings is None else ReverbProcessor(settings, self.sample_rate)
+
     # ---------------------------------------------------------------------
     def synthesize(self, adsr: ADSRSettings, volume: float = 1.0, *, waveform: Literal["saw", "sine"] = "saw") -> np.ndarray:  # noqa: D401
         """Return 16‑bit integer samples ready for playback or saving."""
@@ -85,6 +94,17 @@ class LaserSynth:
                 self._dist_proc.settings.envelope = envelope[:length]
             wave = self._dist_proc.process(wave)
 
+
+        # 3) optional reverb – pad with silence so its tail isn’t chopped off
+        if self._reverb_proc is not None:
+            tail_seconds = (
+                self._reverb_proc.settings.decay
+                + self._reverb_proc.settings.predelay_ms / 1000.0
+            )
+            tail_samples = int(tail_seconds * self.sample_rate)
+            wave = self._reverb_proc.process(
+                np.concatenate([wave, np.zeros(tail_samples, dtype=wave.dtype)])
+            )
 
         # Apply volume (0‑1) before conversion
         wave = np.clip(wave * volume, -1.0, 1.0)
