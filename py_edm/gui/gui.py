@@ -59,7 +59,7 @@ class KnobWidget(QGroupBox):
         self.setTitle(label)
         self.setLayout(QVBoxLayout())
 
-        self.dial = QDial()
+        self.dial = DragDial()
         self.dial.setRange(min_val, max_val)
         self.dial.setSingleStep(step)
         self.dial.setValue(init_val)
@@ -128,6 +128,53 @@ class KnobWidget(QGroupBox):
         app.setPalette(pal)
         app._dark_mode_applied = True
 
+# ── NEW:   dial that reacts to mouse-drag instead of circular motion ──────────
+class DragDial(QDial):
+    """
+    QDial whose value changes with *linear* mouse movement rather than rotation.
+
+    Up-or-right  →  value ↑  
+    Down-or-left →  value ↓
+    """
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._last = None          # remember last mouse-pos while dragging
+        self.setWrapping(False)    # no wrap-around
+        self.setNotchesVisible(True)
+
+    # ------------------------------------------------------------------ mouse
+    def mousePressEvent(self, ev):
+        # Begin linear drag – capture start position **without** invoking
+        # QDial’s default angle-based handling (which caused snap-back).
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._last = ev.position()
+            ev.accept()
+            return                    # ← stop event propagation
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        # While custom-dragging, override value changes completely.
+        if self._last is None:
+            super().mouseMoveEvent(ev)
+            return
+
+        delta = ev.position() - self._last
+        step   = self.singleStep() or 1
+        change = int((-delta.y() + delta.x()) * step / 3)  # divide → nice feel
+
+        if change:
+            self.setValue(max(self.minimum(),
+                         min(self.maximum(), self.value() + change)))
+            self._last = ev.position()
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        # Finish drag and keep the exact value set during movement.
+        self._last = None
+        ev.accept()
+        return 
+
+
 # -----------------------------------------------------------------------------
 # Legacy sliders for the effect dialogs (unchanged)
 # -----------------------------------------------------------------------------
@@ -172,12 +219,10 @@ class ReverbDialog(QDialog):
         self.setLayout(QVBoxLayout())
 
         # Decay slider (0.3–8 s)
-        self.decay_slider = ADSRSlider("Decay (RT60)", 300, 8000, 2200, "ms")
-        self.layout().addWidget(self.decay_slider)
-
-        # Mix slider
-        self.mix_slider = ADSRSlider("Wet / Dry", 0, 100, 35, "%")
-        self.layout().addWidget(self.mix_slider)
+        self.decay_knob = KnobWidget("Decay (RT60)", 300, 8000, 2200, "ms", 50)
+        self.mix_knob   = KnobWidget("Wet / Dry",    0,   100,   35,  "%")
+        self.layout().addWidget(self.decay_knob)
+        self.layout().addWidget(self.mix_knob)
 
         # OK / Cancel
         buttons = QDialogButtonBox(
@@ -188,15 +233,15 @@ class ReverbDialog(QDialog):
         self.layout().addWidget(buttons)
 
         if current:
-            self.decay_slider.slider.setValue(int(current.decay * 1000))
-            self.mix_slider.slider.setValue(int(current.mix * 100))
+           self.decay_knob.dial.setValue(int(current.decay * 1000))
+           self.mix_knob.dial.setValue(int(current.mix * 100))
 
     def settings(self) -> ReverbSettings:
         return ReverbSettings(
-            decay=self.decay_slider.value() / 1000.0,
-            mix=self.mix_slider.value() / 100.0,
-            predelay_ms=20,  # fixed for now – expose if you like
-        )
+           decay=self.decay_knob.value() / 1000.0,
+           mix=self.mix_knob.value()     / 100.0,
+           predelay_ms=20,
+       )
 
 
 class DistortionDialog(QDialog):
@@ -275,10 +320,10 @@ class SynthUI(QWidget):
         # Knobs (Attack, Decay, Sustain, Release, Volume)
         # --------------------------------------------------------------
         knob_grid = QGridLayout()
-        self.attack_knob = KnobWidget("Attack", 1, 1_000, 50, "ms")
-        self.decay_knob = KnobWidget("Decay", 1, 1_000, 100, "ms")
+        self.attack_knob  = KnobWidget("Attack",  1,   1_000,  50,  "ms", 10)
+        self.decay_knob   = KnobWidget("Decay",   1,   1_000, 100, "ms", 10)
         self.sustain_knob = KnobWidget("Sustain", 0, 100, 50, "%")
-        self.release_knob = KnobWidget("Release", 10, 2_000, 300, "ms")
+        self.release_knob = KnobWidget("Release", 10,   2_000, 300, "ms", 20)
         self.volume_knob = KnobWidget("Volume", 0, 100, 100, "%")
 
         knobs = [
@@ -292,6 +337,24 @@ class SynthUI(QWidget):
             knob_grid.addWidget(knob, i // 3, i % 3)
 
         layout.addLayout(knob_grid)
+
+        # --------------------------------------------------------------
+        # ADSR envelope preview
+        # --------------------------------------------------------------
+        self.adsr_plot = pg.PlotWidget(title="ADSR Envelope")
+        self.adsr_plot.setBackground("#1e1e1e")
+        self.adsr_plot.setYRange(0, 1.05)
+        self.adsr_plot.getPlotItem().hideAxis("bottom")
+        layout.addWidget(self.adsr_plot)
+
+        # Update preview whenever ADSR knobs move
+        for knob in (
+            self.attack_knob,
+            self.decay_knob,
+            self.sustain_knob,
+            self.release_knob,
+        ):
+            knob.dial.valueChanged.connect(self._refresh_adsr_plot)
 
         # --------------------------------------------------------------
         # Waveform graph (PyQtGraph)
@@ -321,6 +384,9 @@ class SynthUI(QWidget):
         layout.addWidget(self.dist_btn)
         layout.addWidget(self.reverb_btn)
 
+        # Initial ADSR draw
+        self._refresh_adsr_plot()
+
     # ------------------------------------------------------------------
     # 🎚  helpers
     # ------------------------------------------------------------------
@@ -334,6 +400,41 @@ class SynthUI(QWidget):
 
     def _volume(self) -> float:
         return self.volume_knob.value() / 100.0
+
+    # ------------------------------------------------------------------
+    # 📈  ADSR envelope preview
+    # ------------------------------------------------------------------
+    def _refresh_adsr_plot(self) -> None:
+        """Render an exponential-style ADSR envelope preview."""
+        atk = self.attack_knob.value() / 1000.0
+        dec = self.decay_knob.value() / 1000.0
+        sus = self.sustain_knob.value() / 100.0
+        rel = self.release_knob.value() / 1000.0
+
+        sr = 1000  # 1 kHz resolution for plotting
+
+        # Attack (0 → 1)
+        t_a = np.linspace(0, atk, max(1, int(sr * atk)), endpoint=False)
+        env_a = 1 - np.exp(-5 * t_a / atk) if atk else np.array([])
+
+        # Decay (1 → sustain)
+        t_d = np.linspace(0, dec, max(1, int(sr * dec)), endpoint=False)
+        env_d = sus + (1 - sus) * np.exp(-5 * t_d / dec) if dec else np.array([])
+
+        # Sustain (flat 200 ms)
+        t_s = np.linspace(0, 0.2, int(sr * 0.2), endpoint=False)
+        env_s = np.full_like(t_s, sus)
+
+        # Release (sustain → 0)
+        t_r = np.linspace(0, rel, max(1, int(sr * rel)))
+        env_r = sus * np.exp(-5 * t_r / rel) if rel else np.array([])
+
+        env = np.concatenate([env_a, env_d, env_s, env_r])
+        t = np.arange(env.size) / sr
+
+        self.adsr_plot.clear()
+        if env.size:
+            self.adsr_plot.plot(t, env, pen=pg.mkPen(width=2))
 
     # ------------------------------------------------------------------
     # 🔊  playback / save
