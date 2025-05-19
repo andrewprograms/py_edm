@@ -192,21 +192,39 @@ class _DraggablePoint(pg.ScatterPlotItem):
                          **spot_kw)
         self.setAcceptHoverEvents(True)
 
-    # …all the mouse stuff lives here…
+    # proper data-space dragging ------------------------------------------------
     def mouseDragEvent(self, ev):
         if ev.button() != Qt.MouseButton.LeftButton:
-            ev.ignore(); return
-        if ev.isStart():                     # remember offset
-            self._start  = self.pos()
-            self._dstart = ev.pos()
-            ev.accept(); return
-        if ev.isFinish():
-            ev.accept(); return
+            ev.ignore()
+            return
 
-        # Map Qt-coords → plot-coords, move the point and notify listeners
-        delta = self.mapToParent(ev.pos()) - self.mapToParent(self._dstart)
-        new_p = self._start + delta
-        self.setData(pos=[(new_p.x(), new_p.y())])
+        view = self.getViewBox()
+        if view is None:                    # should never happen
+            ev.ignore()
+            return
+
+        if ev.isStart():                    # remember starting points
+            # Both “start” refs must be in *data* coordinates
+            self._start_view = view.mapSceneToView(ev.scenePos())   # click-pos
+            self._start_data = self._start_view                     # point-pos
+            ev.accept()
+            return
+
+        if ev.isFinish():
+            ev.accept()
+            return
+
+        # Δ in *data* coordinates, not pixels
+        curr_view = view.mapSceneToView(ev.scenePos())
+        # pointer delta in data-space
+        delta = curr_view - self._start_view
+        new_p = self._start_data + delta
+
+        # clamp to sensible ADSR bounds
+        new_x = max(0.0, new_p.x())
+        new_y = min(1.2, max(0.0, new_p.y()))
+
+        self.setData(pos=[(new_x, new_y)])
         self.sigMoved.emit(self)
         ev.accept()
 
@@ -478,7 +496,7 @@ class SynthUI(QWidget):
         self.decay_knob   = KnobWidget("Decay",   1,   1_000, 100, "ms", 10)
         self.sustain_knob = KnobWidget("Sustain", 0, 100, 50, "%")
         self.release_knob = KnobWidget("Release", 10,   2_000, 300, "ms", 20)
-        self.volume_knob = KnobWidget("Volume", 0, 100, 100, "%")
+        self.volume_knob = KnobWidget("Volume", 0, 100, 50, "%")
 
         knobs = [
             self.attack_knob,
@@ -537,15 +555,25 @@ class SynthUI(QWidget):
 
         # graph –→ knobs
         def _safe_set(dial, val):
-            dial.blockSignals(True); dial.setValue(val); dial.blockSignals(False)
+            if dial.value() == val:                # already there → nothing to do
+                return
 
-        self.adsr_plot.attackChanged.connect(lambda ms: _safe_set(self.attack_knob.dial,  ms))
-        self.adsr_plot.decayChanged.connect( lambda ms: _safe_set(self.decay_knob.dial,   ms))
-        self.adsr_plot.releaseChanged.connect(lambda ms: _safe_set(self.release_knob.dial, ms))
-        self.adsr_plot.sustainChanged.connect(
-            lambda pct: _safe_set(self.sustain_knob.dial, pct))
+            knob = dial.parent()                   # KnobWidget
+            dial.blockSignals(True)                # stop loops
+            dial.setValue(val)
+            dial.blockSignals(False)
 
-        # no explicit initial draw – ADSRGraph already plotted itself
+            # we suppressed valueChanged → update label manually
+            if hasattr(knob, "_update_label"):
+                knob._update_label(val)
+
+        self.adsr_plot.attackChanged .connect(lambda v: _safe_set(self.attack_knob.dial,  v))
+        self.adsr_plot.decayChanged  .connect(lambda v: _safe_set(self.decay_knob.dial,   v))
+        self.adsr_plot.releaseChanged.connect(lambda v: _safe_set(self.release_knob.dial, v))
+        self.adsr_plot.sustainChanged.connect(lambda v: _safe_set(self.sustain_knob.dial, v))
+
+        # 🔄 make sure graph & knobs are linked *immediately*
+        self.adsr_plot.set_from_knobs(self._collect_adsr())
 
     # ------------------------------------------------------------------
     # 🎚  helpers
