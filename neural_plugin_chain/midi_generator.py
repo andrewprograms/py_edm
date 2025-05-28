@@ -1,220 +1,245 @@
-import pygame.midi
-import time
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
 import threading
+import time
 import random
-import numpy as np
+from pathlib import Path
 
-"""
-Groove Generator v2 – melodic‑house edition
--------------------------------------------
-* Key: E minor
-* Bass‑lines: Euclidean & off‑beat patterns that lock to the kick
-* Top‑line: chord‑aware, step‑wise melody with phrase memory
-* All timing is sample‑accurate (single scheduler thread)
-* Optional Magenta RNN backend (Melody RNN / ImprovRNN) – enable by
-  setting USE_MAGENTA = True and installing magenta‑music.
-* Dependencies: pygame.midi, numpy, (optional) magenta‑music
-"""
+import pygame.midi
 
-# === USER SETTINGS ===
-BPM            = 123
-SWING          = 0.05            # delay the off‑beat 8ths (0–0.08)
-VELOCITY       = 100
-KEY            = "E"             # root note
-MODE           = "minor"         # scale mode
-LENGTH_BARS    = 4               # how many bars to generate per run
-USE_MAGENTA    = True           # set True if magenta is installed & configured
+import mido
 
-# ------------------------------------
-# === MIDI SET‑UP ===
+# ────────────────────────────────────────────────────────────────────────────────
+# User switches
+# ────────────────────────────────────────────────────────────────────────────────
+BPM                = 123
+SWING              = 0.05        # 0‑0.08
+LENGTH_BARS        = 4
+USE_MAGENTA_STUDIO = True        # hand‑off to Magenta Studio CLI
+#   Hard‑coded full path to Generate.exe provided by the user
+print('MEGENTA_GEN' in os.environ)
+print(os.environ.get('MEGENTA_GEN'))
+_MAGENTA_DIR = os.environ.get('MEGENTA_GEN')
+print("magenta dir: ", _MAGENTA_DIR)
+MAGENTA_BIN        = os.path.join(_MAGENTA_DIR , "Generate.exe")
+KEEP_TEMP          = False       # keep exported MIDI for debugging
+
+# ────────────────────────────────────────────────────────────────────────────────
+# MIDI I/O setup
+# ────────────────────────────────────────────────────────────────────────────────
 pygame.midi.init()
 try:
-    player = pygame.midi.Output(0)  # change if default is not 0
+    player = pygame.midi.Output(0)
 except pygame.midi.MidiException:
-    raise RuntimeError("No MIDI output device available. Please connect one and restart.")
+    raise RuntimeError("No MIDI output device. Connect one and restart.")
 
 BASS_CH, LEAD_CH = 0, 1
+VELOCITY = 100
 
-# === TIME CONSTANTS ===
-QUARTER     = 60.0 / BPM
-EIGHTH      = QUARTER / 2
-SIXTEENTH   = QUARTER / 4
+# Time constants
+QUARTER   = 60.0 / BPM
+EIGHTH    = QUARTER / 2
+SIXTEENTH = QUARTER / 4
 
-# === THEORY HELPERS ===
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+# ────────────────────────────────────────────────────────────────────────────────
+# Music theory helpers
+# ────────────────────────────────────────────────────────────────────────────────
+NOTE_NAMES  = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+SCALE_NAMES = ["E","F#","G","A","B","C","D"]  # natural minor
+SCALE_IDX   = {n:i for i,n in enumerate(SCALE_NAMES)}
+CHORD_ROOTS = ["E","C","D","B"]                 # i‑VI‑VII‑v
+QUALITIES   = {"E":"minor","C":"major","D":"major","B":"minor"}
+INTERVALS   = {"major":[0,4,7], "minor":[0,3,7]}
 
-SCALE_NAMES = ["E", "F#", "G", "A", "B", "C", "D"]  # natural minor
-SCALE_IDX   = {n: i for i, n in enumerate(SCALE_NAMES)}
+def note_num(name:str, octave:int)->int:
+    return 12*(octave+1)+NOTE_NAMES.index(name)
 
-CHORD_ROOTS      = ["E", "C", "D", "B"]  # 4‑bar loop i – VI – VII – v
-CHORD_QUALITIES  = {"E": "minor", "C": "major", "D": "major", "B": "minor"}
-CHORD_INTERVALS  = {"major": [0, 4, 7], "minor": [0, 3, 7]}
+def chord_notes(root:str, octave:int=4):
+    return [note_num(root, octave)+i for i in INTERVALS[QUALITIES[root]]]
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Bass‑line generator (Euclidean pulse + octave/fifth fills)
+# ────────────────────────────────────────────────────────────────────────────────
 
-def note_num(name: str, octave: int) -> int:
-    """Convert note name to MIDI note number in given octave."""
-    return 12 * (octave + 1) + NOTE_NAMES.index(name)
-
-
-def chord_notes(root: str, octave: int = 4):
-    """Return MIDI numbers for the triad rooted at *root* in *octave*."""
-    intervals = CHORD_INTERVALS[CHORD_QUALITIES[root]]
-    r = note_num(root, octave)
-    return [r + i for i in intervals]
-
-
-# === EUCLIDEAN RHYTHM UTILITY ===
-
-def euclidean_rhythm(pulses: int, steps: int):
-    """Classic Björklund algorithm (binary pattern as list)."""
-    pattern, bucket = [], 0
-    for _ in range(steps):
-        bucket += pulses
-        if bucket >= steps:
-            bucket -= steps
-            pattern.append(1)
+def euclid(p:int, n:int):
+    bucket, pat = 0, []
+    for _ in range(n):
+        bucket += p
+        if bucket >= n:
+            bucket -= n; pat.append(1)
         else:
-            pattern.append(0)
-    return pattern
+            pat.append(0)
+    return pat
 
-
-# === BASS‑LINE GENERATOR ===
 BASS_PATTERNS = [
-    # Classic house off‑beat root pump (root on the "&" of every beat)
-    {"rhythm": euclidean_rhythm(4, 8), "intervals": [0, 0, 12, 0]},
-    # Root–5th drive (straight 8ths)
-    {"rhythm": [1, 0, 1, 0, 1, 0, 1, 0], "intervals": [0, 7, 0, 7]},
-    # Root / octave converse
-    {"rhythm": [1, 0, 1, 0, 1, 0, 1, 0], "intervals": [0, 12, 7, 12]},
+    {"rhythm": euclid(4,8), "intervals": [0,0,12,0]},
+    {"rhythm": [1,0,1,0,1,0,1,0], "intervals": [0,7,0,7]},
+    {"rhythm": [1,0,1,0,1,0,1,0], "intervals": [0,12,7,12]},
 ]
 
-
-def generate_bassline(num_bars: int = LENGTH_BARS):
-    """Return list of (time, pitch, dur, ch) for the bass line."""
-    events = []
-    for bar in range(num_bars):
-        root_name  = CHORD_ROOTS[bar % len(CHORD_ROOTS)]
-        root_midi  = note_num(root_name, 2)
-        pattern    = random.choice(BASS_PATTERNS)
-        rhythm     = pattern["rhythm"]
-        intervals  = pattern["intervals"]
-        iv_idx     = 0
-        for step, hit in enumerate(rhythm):
+def gen_bass(bars:int=LENGTH_BARS):
+    events=[]
+    for bar in range(bars):
+        root = CHORD_ROOTS[bar%len(CHORD_ROOTS)]
+        root_m = note_num(root, 2)
+        pat = random.choice(BASS_PATTERNS)
+        iv_i = 0
+        for step, hit in enumerate(pat["rhythm"]):
             if not hit:
                 continue
-            offset_beats = step * 0.5  # 8th‑note grid
-            t = bar * 4 * QUARTER + offset_beats * QUARTER
-            if step % 2 == 1:  # swing the off‑beats
+            t = bar*4*QUARTER + step*EIGHTH
+            if step % 2:
                 t += SWING * EIGHTH
-            interval = intervals[iv_idx % len(intervals)]
-            iv_idx += 1
-            pitch = root_midi + interval
-            events.append((t, pitch, EIGHTH * 0.95, BASS_CH))
+            interval = pat["intervals"][iv_i % len(pat["intervals"])]
+            iv_i += 1
+            events.append((t, root_m + interval, EIGHTH*0.95, BASS_CH))
     return events
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Melody generator (internal fallback – chord‑aware step walker)
+# ────────────────────────────────────────────────────────────────────────────────
+_BASE_W = {-2:1,-1:4,0:2,1:4,2:1,3:0.5,-3:0.5,4:0.2,-4:0.2}
 
-# === MELODY GENERATOR ===
-# Step‑wise weights; adjusted later for chord‑tone emphasis
-_BASE_WEIGHTS = {
-    -2: 1, -1: 4, 0: 2, 1: 4, 2: 1, 3: 0.5, -3: 0.5, 4: 0.2, -4: 0.2
-}
-
-
-def generate_lead(num_bars: int = LENGTH_BARS):
-    """Chord‑aware step‑wise melody.«"""
-    events, last_pitch = [], None
-    for bar in range(num_bars):
-        chord_midis = chord_notes(CHORD_ROOTS[bar % len(CHORD_ROOTS)], 5)
-        for sub in range(8):          # 8th‑note grid per bar
-            t = bar * 4 * QUARTER + sub * EIGHTH
+def gen_lead_internal(bars:int=LENGTH_BARS):
+    events, last = [], None
+    for bar in range(bars):
+        chord = chord_notes(CHORD_ROOTS[bar%len(CHORD_ROOTS)], 5)
+        for sub in range(8):
+            t = bar*4*QUARTER + sub*EIGHTH
             dur = random.choice([EIGHTH, SIXTEENTH])
-            # density: strong beats always play; weak beats 50 %
             if sub % 2 == 0 or random.random() < 0.5:
-                if last_pitch is None:
-                    pitch = random.choice(chord_midis)
+                if last is None:
+                    pitch = random.choice(chord)
                 else:
-                    candidates, weights = [], []
-                    for step, base_w in _BASE_WEIGHTS.items():
-                        cand = last_pitch + step
-                        # bias to chord‑tones on the beat
-                        bias = 2 if (cand % 12) in [(p % 12) for p in chord_midis] else 1
-                        candidates.append(cand)
-                        weights.append(base_w * bias)
-                    pitch = random.choices(candidates, weights=weights, k=1)[0]
-                    # constrain range
-                    while pitch < 65:
-                        pitch += 12
-                    while pitch > 88:
-                        pitch -= 12
-                last_pitch = pitch
-                events.append((t, pitch, dur * 0.95, LEAD_CH))
+                    cand, w = [], []
+                    for step, bw in _BASE_W.items():
+                        p = last + step
+                        bias = 2 if (p % 12) in [c % 12 for c in chord] else 1
+                        cand.append(p); w.append(bw * bias)
+                    pitch = random.choices(cand, weights=w, k=1)[0]
+                    while pitch < 65: pitch += 12
+                    while pitch > 88: pitch -= 12
+                last = pitch
+                events.append((t, pitch, dur*0.95, LEAD_CH))
+    return events
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Magenta Studio hand‑off helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def events_to_midi(events, path:str):
+    if mido is None:
+        raise RuntimeError("mido not installed – cannot export MIDI.")
+    mid = mido.MidiFile(type=1)
+    tr = mido.MidiTrack(); mid.tracks.append(tr)
+    last_tick = 0
+    for t,p,d,ch in sorted(events, key=lambda e:e[0]):
+        on_tick = int(mido.second2tick(t, mid.ticks_per_beat, BPM))
+        tr.append(mido.Message('note_on', note=p, velocity=VELOCITY, channel=ch, time=on_tick-last_tick))
+        off_tick = int(mido.second2tick(d, mid.ticks_per_beat, BPM))
+        tr.append(mido.Message('note_off', note=p, velocity=0, channel=ch, time=off_tick))
+        last_tick = on_tick + off_tick
+    mid.save(path)
+
+
+def midi_to_events(path:str, ch_map:dict):
+    if mido is None:
+        raise RuntimeError("mido not installed – cannot parse MIDI.")
+    mid = mido.MidiFile(path)
+    abs_ticks = 0
+    events = []
+    for msg in mid:
+        abs_ticks += msg.time
+        if msg.type in ('note_on', 'note_off') and msg.velocity > 0:
+            sec = mido.tick2second(abs_ticks, mid.ticks_per_beat, BPM)
+            ch  = ch_map.get(msg.channel, LEAD_CH)
+            events.append((sec, msg.note, SIXTEENTH*0.95, ch))
     return events
 
 
-# === OPTIONAL MAGENTA BACK‑END ===
-if USE_MAGENTA:
+def call_magenta_generate(seed:Path, bars:int):
+    """Invoke the hard‑coded Generate.exe and return first generated MIDI."""
+    exe = Path(MAGENTA_BIN)
+    if not exe.exists():
+        print(f"Generate.exe not found at {exe} – falling back to internal melody generator.")
+        return None
+
+    out_dir = Path(tempfile.mkdtemp(prefix="magenta_out_"))
+    cmd = [str(exe),
+           "--input", str(seed),
+           "--output", str(out_dir),
+           "--length", str(bars*4),
+           "--temperature", "0.5",
+           "--num_outputs", "4"]
+
+    run_kwargs = dict(check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        from magenta.music import (melody_rnn_generate_sequence,
-                                   sequence_generator_bundle,
-                                   note_sequence_to_pretty_midi)
-        from magenta.protobuf import music_pb2
+        # exe is an .exe on Windows – no shell=True needed
+        subprocess.run(cmd, **run_kwargs)
+    except subprocess.CalledProcessError as e:
+        print(f"Generate.exe failed ({e}) – falling back to internal generator.")
+        return None
+    except PermissionError:
+        print("Permission denied launching Generate.exe – unblock the file or run as admin")
+        return None
 
-        # Point to a trained bundle (MelodyRNN or ImprovRNN).
-        BUNDLE_PATH = "basic_rnn.mag"
-        _bundle = sequence_generator_bundle.read_bundle_file(BUNDLE_PATH)
+    files = sorted(out_dir.glob("*.mid"))
+    if not files:
+        print("Generate.exe produced no MIDI – falling back.")
+        return None
+    return files[0]
 
-        def generate_lead(num_bars: int = LENGTH_BARS):  # type: ignore
-            """Use Magenta MelodyRNN for the top line if available."""
-            primer = music_pb2.NoteSequence()
-            primer.tempos.add(qpm=BPM)
-            generator_options = melody_rnn_generate_sequence.protobuf.generator_pb2.GeneratorOptions()
-            generator_options.generate_sections.add(
-                start_time=0,
-                end_time=num_bars * 4 * QUARTER)
-            seq = melody_rnn_generate_sequence(_bundle, primer, generator_options)
-            events = []
-            for n in seq.notes:
-                events.append((n.start_time, n.pitch, n.end_time - n.start_time, LEAD_CH))
-            return events
-    except Exception as e:  # noqa: BLE001
-        print("Magenta unavailable – falling back to internal melody generator:", e)
-        USE_MAGENTA = False
+# ────────────────────────────────────────────────────────────────────────────────
+# Scheduler – sample‑accurate, daemonized note‑off
+# ────────────────────────────────────────────────────────────────────────────────
 
-
-# === SCHEDULER ===
-
-def play_events(events):
-    events.sort(key=lambda e: e[0])
+def play(events):
+    events = sorted(events, key=lambda e:e[0])
     start = time.perf_counter()
 
-    def note_off_later(p, ch, d):
-        time.sleep(d)
-        player.note_off(p, VELOCITY, ch)
+    def note_off(pitch, ch, dur):
+        time.sleep(dur)
+        player.note_off(pitch, VELOCITY, ch)
 
-    for note_time, pitch, dur, ch in events:
-        while time.perf_counter() - start < note_time:
+    for t,p,d,ch in events:
+        while time.perf_counter() - start < t:
             time.sleep(0.0005)
-        player.note_on(pitch, VELOCITY, ch)
-        threading.Thread(target=note_off_later, args=(pitch, ch, dur), daemon=True).start()
+        player.note_on(p, VELOCITY, ch)
+        threading.Thread(target=note_off, args=(p,ch,d), daemon=True).start()
 
-    # let tails ring
-    longest = max(t + d for t, _, d, _ in events)
+    longest = max(t+d for t,_,d,_ in events)
     while time.perf_counter() - start < longest + 0.5:
         time.sleep(0.02)
+    for n in range(128):
+        player.note_off(n, VELOCITY, BASS_CH)
+        player.note_off(n, VELOCITY, LEAD_CH)
 
-    # panic / all‑notes‑off
-    for p in range(128):
-        player.note_off(p, VELOCITY, BASS_CH)
-        player.note_off(p, VELOCITY, LEAD_CH)
-
-
-# === MAIN ===
+# ────────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        print("▶ Generating melodic‑house groove in E minor…")
-        bass_events = generate_bassline(LENGTH_BARS)
-        lead_events = generate_lead(LENGTH_BARS)
-        play_events(bass_events + lead_events)
+        bass = gen_bass(LENGTH_BARS)
+
+        if USE_MAGENTA_STUDIO and mido is not None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                seed_path = Path(tmpdir) / "seed.mid"
+                events_to_midi(gen_lead_internal(LENGTH_BARS), seed_path)
+                gen_path = call_magenta_generate(seed_path, LENGTH_BARS)
+                if gen_path is not None:
+                    lead = midi_to_events(gen_path, {0: LEAD_CH})
+                    if KEEP_TEMP:
+                        Path("mag_seed.mid").write_bytes(seed_path.read_bytes())
+                        Path("mag_gen.mid").write_bytes(gen_path.read_bytes())
+                else:
+                    lead = gen_lead_internal(LENGTH_BARS)
+        else:
+            lead = gen_lead_internal(LENGTH_BARS)
+
+        play(bass + lead)
     finally:
         player.close()
         pygame.midi.quit()
