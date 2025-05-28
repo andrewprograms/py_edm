@@ -1,6 +1,7 @@
 import sys
 import math
 import struct
+import torch
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -12,15 +13,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QIODevice, QTimer
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices, QAudio
+from neural_waveshaping_synthesis.models.newt import FastNEWT  # ← Fast‑NEWT CNN
 
 
 class SineWaveIODevice(QIODevice):
-    """Continuous sine-wave generator with built‑in attack/release envelope.
-
-    Pops are eliminated by shaping the audio *samples themselves*, not by
-    fiddling with master volume.  Every note starts at a zero‑crossing and is
-    faded in/out with a short linear (or optionally cosine) envelope so the DAC
-    never sees a discontinuity.
+    """Continuous sine‑wave generator with attack/release envelope
+    and a *Fast‑NEWT* neural waveshaping distortion (learned DDSP‑style).
     """
 
     def __init__(
@@ -31,6 +29,7 @@ class SineWaveIODevice(QIODevice):
         sample_format: QAudioFormat.SampleFormat,
         attack_ms: int = 10,
         release_ms: int = 10,
+        dist_amount: float = 0.0,  # 0‒1 wet/dry for the neural distortion
     ):
         super().__init__()
         self.frequency = frequency
@@ -38,17 +37,21 @@ class SineWaveIODevice(QIODevice):
         self.channel_count = channel_count
         self.sample_format = sample_format
 
-        # Phase accumulator (start at 0 => exact zero‑crossing)
+        # Phase accumulator -------------------------------------------
         self.phase = 0.0
         self.phase_inc = 2 * math.pi * self.frequency / self.sample_rate
 
-        # Envelope parameters -----------------------------------------
+        # Envelope parameters ----------------------------------------
         self.attack_samples = max(1, int(self.sample_rate * attack_ms / 1000.0))
         self.release_samples = max(1, int(self.sample_rate * release_ms / 1000.0))
         self.env_state: str = "attack"  # attack → sustain → release
-        self.env_index = 0  # counts samples within current state
+        self.env_index = 0
 
-        # Packing details ---------------------------------------------
+        # Distortion --------------------------------------------------
+        self.dist_amount = dist_amount  # 0‑1 wet/dry
+        self._init_newt()
+
+        # Sample packing ---------------------------------------------
         if self.sample_format == QAudioFormat.SampleFormat.Int16:
             self.pack_fmt = "<h"
             self.bytes_per_sample = 2
@@ -63,6 +66,17 @@ class SineWaveIODevice(QIODevice):
         self.open(QIODevice.OpenModeFlag.ReadOnly)
 
     # ------------------------------------------------------------------
+    # NEWT initialisation ----------------------------------------------
+    # ------------------------------------------------------------------
+    def _init_newt(self):
+        """Load Fast‑NEWT checkpoint from local file."""
+        self.newt = FastNEWT().to("cpu").eval()
+        ckpt = torch.load("FastNEWT_fuzz.pt", map_location="cpu")
+        self.newt.load_state_dict(ckpt)
+        # Re‑usable tensor to avoid alloc every call
+        self._newt_in = torch.zeros((1, 1, 1), dtype=torch.float32)
+
+    # ------------------------------------------------------------------
     # Public control ----------------------------------------------------
     # ------------------------------------------------------------------
     def start_release(self):
@@ -70,6 +84,27 @@ class SineWaveIODevice(QIODevice):
             return
         self.env_state = "release"
         self.env_index = 0
+
+    def set_distortion_amount(self, amt: float):
+        """Set wet/dry mix (0‒1)."""
+        self.dist_amount = max(0.0, min(1.0, amt))
+
+    # ------------------------------------------------------------------
+    # Neural distortion per‑sample -------------------------------------
+    # ------------------------------------------------------------------
+    def _apply_distortion(self, dry_sample: float) -> float:
+        """Run one sample through Fast‑NEWT and blend wet/dry."""
+        if self.dist_amount <= 0.0:
+            return dry_sample
+
+        # Scale to [-1,1] float32 for the network
+        self._newt_in[0, 0, 0] = dry_sample / self.amp
+        with torch.no_grad():
+            wet_norm = self.newt(self._newt_in).item()
+        wet_sample = wet_norm * self.amp
+
+        # Linear cross‑fade wet/dry
+        return (1 - self.dist_amount) * dry_sample + self.dist_amount * wet_sample
 
     # ------------------------------------------------------------------
     # QIODevice overrides ----------------------------------------------
@@ -87,7 +122,7 @@ class SineWaveIODevice(QIODevice):
         offset = 0
 
         for _ in range(n_frames):
-            # ------- Envelope calculation per frame ------------------
+            # Envelope --------------------------------------------------
             if self.env_state == "attack":
                 env = self.env_index / self.attack_samples
                 self.env_index += 1
@@ -100,12 +135,15 @@ class SineWaveIODevice(QIODevice):
                 env = max(0.0, 1 - self.env_index / self.release_samples)
                 self.env_index += 1
 
-            sample_val = math.sin(self.phase) * self.amp * env
+            # Base sine sample -----------------------------------------
+            dry = math.sin(self.phase) * self.amp * env
+            sample_val = self._apply_distortion(dry)
 
             for _ in range(self.channel_count):
                 struct.pack_into(self.pack_fmt, data, offset, sample_val)
                 offset += self.bytes_per_sample
 
+            # Phase advance -------------------------------------------
             self.phase += self.phase_inc
             if self.phase >= 2 * math.pi:
                 self.phase -= 2 * math.pi
@@ -117,14 +155,14 @@ class SineWaveIODevice(QIODevice):
 
 
 class SineWavePlayer(QWidget):
-    """Tiny Qt6 tone generator with pop‑free attack & release."""
+    """Tiny Qt6 tone generator with pop‑free attack/release and Fast‑NEWT neural distortion."""
 
     ENV_MS = 10  # attack & release length in milliseconds
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("55 Hz Sine‑Wave Player")
-        self.resize(340, 180)
+        self.setWindowTitle("55 Hz Sine‑Wave Player (Fast‑NEWT Distortion)")
+        self.resize(340, 240)
 
         # ----------------------------------------------------------
         # Audio format selection
@@ -154,10 +192,19 @@ class SineWavePlayer(QWidget):
         self.stop_btn = QPushButton("■ Stop")
         self.stop_btn.setEnabled(False)
 
+        # Volume slider -------------------------------------------
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(50)
         self.vol_label = QLabel("Volume: 50 %", alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Distortion slider ---------------------------------------
+        self.dist_slider = QSlider(Qt.Orientation.Horizontal)
+        self.dist_slider.setRange(0, 100)
+        self.dist_slider.setValue(0)
+        self.dist_label = QLabel(
+            "Distortion: 0 %", alignment=Qt.AlignmentFlag.AlignCenter
+        )
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.play_btn)
@@ -167,13 +214,17 @@ class SineWavePlayer(QWidget):
         layout.addLayout(btn_row)
         layout.addWidget(self.vol_slider)
         layout.addWidget(self.vol_label)
+        layout.addWidget(self.dist_slider)
+        layout.addWidget(self.dist_label)
 
         self.play_btn.clicked.connect(self.start_playback)
         self.stop_btn.clicked.connect(self.stop_playback)
         self.vol_slider.valueChanged.connect(self.set_volume)
+        self.dist_slider.valueChanged.connect(self.set_distortion)
 
         # Initial volume directly on sink (steady‑state)
         self.sink.setVolume(self.vol_slider.value() / 100.0)
+        self.current_dist_amt = 0.0
 
     # ----------------------------------------------------------
     # Playback control
@@ -189,6 +240,7 @@ class SineWavePlayer(QWidget):
             self.sample_format,
             attack_ms=self.ENV_MS,
             release_ms=self.ENV_MS,
+            dist_amount=self.current_dist_amt,
         )
         self.sink.start(self.io_device)
 
@@ -212,18 +264,16 @@ class SineWavePlayer(QWidget):
     # Misc helpers
     # ----------------------------------------------------------
     def set_volume(self, val: int):
-        self.vol_label.setText(f"Volume: {val} %")
+        self.vol_label.setText(f"Volume: {val}\u00a0%")
         self.sink.setVolume(val / 100.0)
+
+    def set_distortion(self, val: int):
+        self.dist_label.setText(f"Distortion: {val}\u00a0%")
+        self.current_dist_amt = val / 100.0
+        if self.io_device is not None:
+            self.io_device.set_distortion_amount(self.current_dist_amt)
 
     def closeEvent(self, e):  # noqa: N802
         if self.sink.state() == QAudio.State.ActiveState:
             self.io_device.start_release()
-            QTimer.singleShot(self.ENV_MS, self.sink.stop)
-        super().closeEvent(e)
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    player = SineWavePlayer()
-    player.show()
-    sys.exit(app.exec())
+            QTimer.singleShot
